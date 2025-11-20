@@ -2,6 +2,8 @@
 .model tiny
 
 ; ==== Defines ====
+NMI_MASK        equ 080h
+
 RTC_INDEX_PORT  equ 070h
 RTC_DATA_PORT   equ 071h
 
@@ -12,8 +14,8 @@ RTC_A_REG       equ 0Ah
 RTC_B_REG       equ 0Bh
 RTC_C_REG       equ 0Ch
 
-RTC_RS_MASK     equ 0F0h
-RTC_IE_MASK     equ 08Fh
+RTC_RS_MASK     equ 0Fh
+RTC_IE_MASK     equ 070h
 RTC_PIE_BIT     equ 040h
 RTC_UIE_BIT     equ 010h
 RTC_PF_BIT      equ 040h
@@ -26,52 +28,129 @@ PIC2_CMD_PORT   equ 0A0h
 PIC2_DATA_PORT  equ 0A1h
 PIC_EOI_CMD     equ 020h
 
-NMI_MASK        equ 080h
+; ==== 74HC595 cascade pin mapping ====
+;
+; SER -> [ NC | A4 | A3 | A2 | A1 | C | 9 | 8 ] -> [ 7 | 6 | 5 | 4 | 3 | 2 | 1 | 0 ]
+;
+; Legend:
+;  NC       - Not connected
+;  A1-A4    - Anodes for digits 1-4
+;  C        - Colon cathode
+;  0-9      - Digit cathodes
+;
+; LPT pin mapping:
+;  D0 - SER   (serial data input)
+;  D1 - SRCLK (shift register clock)
+;  D2 - RCLK  (latch register clock)
 
 LPT_DATA_PORT   equ 0378h
-LPT_CTRL_PORT	equ 037Ah
+LPT_SER_MASK    equ 01h
+LPT_SRCLK_MASK  equ 02h
+LPT_RCLK_MASK   equ 04h
+
+SHIFT_REG_SIZE  equ 16  ; Two cascaded 74HC595s
+REG_ANODE_SHIFT equ 11
+REG_COLON_SHIFT equ 10
 
 .code
 org 100h
 
 ; The initial entry point *must* be placed at 100h, but we don't need to keep
 ; the initialization part resident. Let's just jump to it instead and place it
-; further in code so we can just ignore it when determining TSR size.
+; further in code so we can simply ignore it when determining TSR size.
 entry_point:
 	jmp init
 
 ; ==== Resident variables ====
-disp_digits     db 0, 0, 0, 0                   ; Time digits (stored in upper nibbles)
+disp_digits     db 0, 0, 0, 0                   ; Time digits
+disp_colon      db 0                            ; Colon state
 disp_index      db 0                            ; Display index for multiplexing
-disp_anode_lut  db 1110b, 1101b, 1011b, 0111b   ; LUT for enabling display anodes
 
 ; ==== Resident procedures ====
 
 ; Clobbers AX, CL
 rtc_get_time proc
+    mov al, RTC_SEC_REG
+    out RTC_INDEX_PORT, al
+    in al, RTC_DATA_PORT        ; Read seconds from RTC
+    and al, 1                   ; Keep only LSB
+    xor al, 1			        ; Invert to turn colon when seconds are even
+    mov disp_colon, al          ; Store in memory as colon state
+
 	mov al, RTC_MIN_REG
 	out RTC_INDEX_PORT, al
 	in al, RTC_DATA_PORT        ; Read minutes from RTC
-
 	mov ah, al
+	and al, 0Fh                 ; AL = ones digit
 	mov cl, 4
-	shl ah, cl                  ; Get ones digit
-	mov disp_digits + 3, ah     ; Store in memory in upper nibble
-	and al, 0F0h                ; Get tens digit
-	mov disp_digits + 2, al     ; Store in memory in upper nibble
+    shr ah, cl                  ; AH = tens digit
+	mov disp_digits + 3, al     ; Store ones in memory
+	mov disp_digits + 2, ah     ; Store tens in memory
 
 	mov al, RTC_HR_REG
-	out RTC_INDEX_PORT, al
-	in al, RTC_DATA_PORT        ; Read hours from RTC
-	mov ah, al
-	mov cl, 4
-	shl ah, cl                  ; Get ones digit
-	mov disp_digits + 1, ah     ; Store in memory in upper nibble
-	and al, 0F0h                ; Get tens digit
-	mov disp_digits + 0, al     ; Store in memory in upper nibble
+    out RTC_INDEX_PORT, al
+    in al, RTC_DATA_PORT        ; Read hours from RTC
+    mov ah, al
+    and al, 0Fh                 ; AL = ones digit
+    mov cl, 4
+    shr ah, cl                  ; AH = tens digit
+    mov disp_digits + 1, al     ; Store ones in memory
+    mov disp_digits + 0, ah     ; Store tens in memory
 
 	ret
 rtc_get_time endp
+
+; Clobbers AX, BX, CX, DX
+display_update proc
+    ; Create new shift register state in BX
+    mov dx, 1 SHL REG_ANODE_SHIFT
+    mov cl, disp_index
+    shl dx, cl              	; DX = anode select bit
+
+    mov al, disp_colon
+    mov cl, REG_COLON_SHIFT
+    shl ax, cl
+    or dx, ax                   ; Add colon bit
+
+    mov al, disp_index
+    mov bx, offset disp_digits
+    xlatb                       ; AL = disp_digits[disp_index]
+    mov cl, al
+    mov bx, 1
+    shl bx, cl
+    or bx, dx                   ; Add digit bit
+
+    ; Write to shift registers
+    mov cx, SHIFT_REG_SIZE
+    mov dx, LPT_DATA_PORT
+write_loop:
+    ; Write next bit
+    mov al, bl
+    and al, LPT_SER_MASK        ; Keep only LSB (595's data pin is wired to D0)
+    out dx, al                  ; Write to port
+
+    ; Pulse clock
+    xor al, LPT_SRCLK_MASK
+    out dx, al                  ; Clock to high
+    xor al, LPT_SRCLK_MASK
+    out dx, al                  ; Clock to low
+
+    ; Move to next bit
+    shr bx, 1
+    loop write_loop
+
+    ; Latch data
+    xor al, LPT_RCLK_MASK
+    out dx, al                  ; Latch to high
+    xor al, LPT_RCLK_MASK
+    out dx, al                  ; Latch to low
+
+    ; Select next display mod 4
+    inc disp_index
+    and disp_index, 3
+
+    ret
+display_update endp
 
 rtc_isr proc
 	; Preserve used registers
@@ -90,43 +169,16 @@ rtc_isr proc
 	in al, RTC_DATA_PORT
 	mov bl, al
 
-	; If update interrupt, update time variables and colon state
+	; If update interrupt, update time variables
 	test bl, RTC_UF_BIT
 	jz check_pf
 	call rtc_get_time
-
-	; Update colon state - turn on if seconds value is odd
-	; TODO this should be RMW, but I have some issues reading
-	; TODO from LPT control port. Needs further investigation.
-	mov al, RTC_SEC_REG
-	out RTC_INDEX_PORT, al
-	in al, RTC_DATA_PORT	; Read RTC seconds register
-	and al, 1				; Keep only LSB
-	xor al, 1               ; Invert it, as AUTOLF LPT line is inverted too
-	shl al, 1               ; Shift to bit 1 to align with AUTOLF bit
-	mov dx, LPT_CTRL_PORT
-	out dx, al				; Write to LPT
 
 check_pf:
 	; If periodic interrupt, update display
 	test bl, RTC_PF_BIT
 	jz isr_exit
-
-	; Create control word and send to LPT port
-	mov al, disp_index
-	mov bx, offset disp_anode_lut
-	xlatb                       ; AL = anode_lut[anode] (bottom nibble)
-	mov ah, al
-	mov al, disp_index
-	mov bx, offset disp_digits
-	xlatb                       ; AL = digits[anode] (top nibble)
-	or al, ah
-	mov dx, LPT_DATA_PORT
-	out dx, al
-
-	; Select next display mod 4
-	inc disp_index
-	and disp_index, 3
+    call display_update
 
 isr_exit:
 	; Send EOI to PICs
@@ -170,14 +222,14 @@ init:
 	mov al, RTC_A_REG + NMI_MASK        ; Select RTC register A, mask NMI
 	out RTC_INDEX_PORT, al
 	in al, RTC_DATA_PORT                ; Read the register
-	and al, RTC_RS_MASK                 ; Clear Rate Selector bits
+	and al, NOT RTC_RS_MASK             ; Clear Rate Selector bits
 	or al, RTC_RS_256HZ                 ; Set periodic interrupt rate to 256Hz
 	out RTC_DATA_PORT, al               ; Write to RTC
 
 	mov al, RTC_B_REG + NMI_MASK        ; Select RTC register B, mask NMI
 	out RTC_INDEX_PORT, al
 	in al, RTC_DATA_PORT                ; Read the register
-	and al, RTC_IE_MASK                 ; Clear interrupt enable flags
+	and al, NOT RTC_IE_MASK             ; Clear interrupt enable flags
 	or al, RTC_PIE_BIT + RTC_UIE_BIT    ; Enable periodic interrupt and update-ended interrupt
 	out RTC_DATA_PORT, al               ; Write to RTC
 
